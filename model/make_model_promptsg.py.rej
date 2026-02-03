@@ -1,0 +1,13 @@
+diff a/model/make_model_promptsg.py b/model/make_model_promptsg.py	(rejected hunks)
+@@ -45,7 +45,10 @@
+         x = self.transformer(x)
+         x = x.permute(1, 0, 2)
+         x = self.ln_final(x).type(self.dtype)
+-        x = x[torch.arange(x.shape[0], device=x.device), tokenized_prompts.argmax(dim=-1)] @ self.text_projection
++        # Explicit EOT position lookup (more robust than argmax)
++        EOT_TOKEN_ID = 49407
++        eot_indices = (tokenized_prompts == EOT_TOKEN_ID).int().argmax(dim=-1)
++        x = x[torch.arange(x.shape[0], device=x.device), eot_indices] @ self.text_projection
+         return x
+ 
+ 
