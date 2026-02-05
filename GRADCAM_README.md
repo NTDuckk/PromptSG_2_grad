@@ -21,6 +21,23 @@ PromptSG_2/
 └── GRADCAM_README.md            # This documentation
 ```
 
+## Dataset Structure
+
+**Important**: The Market-1501 dataset has a specific folder structure:
+```
+datasets/
+└── dataset/
+    └── Market-1501-v15.09.15/
+        ├── bounding_box_train/    # Training images
+        ├── bounding_box_test/     # Gallery images
+        └── query/                 # Query images
+```
+
+When referencing images, use the full path:
+- Query images: `datasets/dataset/Market-1501-v15.09.15/query/`
+- Gallery images: `datasets/dataset/Market-1501-v15.09.15/bounding_box_test/`
+- Training images: `datasets/dataset/Market-1501-v15.09.15/bounding_box_train/`
+
 ## Quick Start
 
 ### 1. Basic Attention Visualization During Testing
@@ -213,3 +230,115 @@ The GradCAM functionality requires:
 - NumPy (already required by PyTorch)
 
 These should already be installed as part of the PromptSG dependencies.
+
+## Kaggle Setup and Usage
+
+Complete example for running on Kaggle:
+
+### 1. Setup Environment
+
+```bash
+# Clone repository
+!git clone https://github.com/NTDuckk/PromptSG_2_grad.git
+%cd PromptSG_2_grad
+
+# Install dependencies
+!pip install -q yacs timm scikit-image tqdm ftfy regex
+!pip install -q gdown
+
+# Download CLIP vocabulary
+!wget -q https://openaipublic.azureedge.net/clip/bpe_simple_vocab_16e6.txt.gz \
+    -O /kaggle/working/PromptSG_2_grad/model/clip/bpe_simple_vocab_16e6.txt.gz
+
+# Create dataset directory and download dataset
+!mkdir -p /kaggle/working/PromptSG_2_grad/datasets/dataset
+!gdown 1MUERj1uq6FQV7cYtDlB5J8D9dbLO6h19 \
+    -O /kaggle/working/PromptSG_2_grad/datasets/dataset/datasets.zip
+!unzip -q /kaggle/working/PromptSG_2_grad/datasets/dataset/datasets.zip \
+    -d /kaggle/working/PromptSG_2_grad/datasets/dataset
+
+# Update config with correct dataset path
+!sed -i 's|ROOT_DIR:.*|ROOT_DIR: /kaggle/working/PromptSG_2_grad/datasets/dataset|' \
+    /kaggle/working/PromptSG_2_grad/configs/person/vit_promptsg.yml
+```
+
+### 2. Train the Model
+
+```bash
+!python train_promptsg.py --config_file configs/person/vit_promptsg.yml
+```
+
+### 3. Test with GradCAM Visualization
+
+```bash
+!python test_promptsg.py \
+    --config_file configs/person/vit_promptsg.yml \
+    --visualize \
+    --num_visualize 50 \
+    TEST.WEIGHT logs/promptsg_market_vit/ViT-B-16_60.pth \
+    OUTPUT_DIR ./test_with_gradcam
+```
+
+### 4. Single Image Visualization
+
+```bash
+# Copy a sample image (use correct dataset path!)
+!cp datasets/dataset/Market-1501-v15.09.15/query/0001_c1s1_001051_00.jpg sample.jpg
+
+# Run visualization with all methods
+!python visualize_gradcam.py \
+    --config_file configs/person/vit_promptsg.yml \
+    --weight logs/promptsg_market_vit/ViT-B-16_60.pth \
+    --image_path sample.jpg \
+    --method all \
+    --layer_type mim \
+    --output_dir ./full_gradcam
+```
+
+### 5. Simple Inference with Attention
+
+```bash
+!python inference_with_gradcam.py \
+    --config configs/person/vit_promptsg.yml \
+    --weights logs/promptsg_market_vit/ViT-B-16_60.pth \
+    --image sample.jpg \
+    --output_dir ./single_image_gradcam
+```
+
+### 6. Compare Query and Gallery Images
+
+```bash
+# Copy query and gallery images (use correct paths!)
+!cp datasets/dataset/Market-1501-v15.09.15/query/0001_c1s1_001051_00.jpg query.jpg
+!cp datasets/dataset/Market-1501-v15.09.15/bounding_box_test/0001_c1s1_001051_00.jpg gallery.jpg
+
+!python inference_with_gradcam.py \
+    --config configs/person/vit_promptsg.yml \
+    --weights logs/promptsg_market_vit/ViT-B-16_60.pth \
+    --query query.jpg \
+    --gallery gallery.jpg \
+    --output_dir ./comparison_gradcam
+```
+
+### 7. Batch Visualization
+
+```bash
+!python visualize_gradcam.py \
+    --config_file configs/person/vit_promptsg.yml \
+    --weight logs/promptsg_market_vit/ViT-B-16_60.pth \
+    --batch_mode \
+    --num_samples 100 \
+    --method mim_attention \
+    --layer_type mim \
+    --output_dir ./batch_gradcam
+```
+
+### Common Issues on Kaggle
+
+1. **Size mismatch error when loading weights**: Make sure you're using the latest code. The `prompt_composer` buffers must be initialized before loading weights.
+
+2. **File not found for images**: Use the correct dataset path structure:
+   - Query: `datasets/dataset/Market-1501-v15.09.15/query/`
+   - Gallery: `datasets/dataset/Market-1501-v15.09.15/bounding_box_test/`
+
+3. **CLIP vocabulary not found**: Ensure the `bpe_simple_vocab_16e6.txt.gz` file is downloaded to `model/clip/`.

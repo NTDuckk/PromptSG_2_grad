@@ -356,6 +356,11 @@ def main():
     print("Creating model...")
     model = make_model(cfg, num_class=num_classes, camera_num=camera_num, view_num=view_num)
 
+    # Initialize prompt_composer buffers before loading weights
+    # This ensures the buffers have the correct shape to receive checkpoint data
+    print("Initializing prompt composer...")
+    model.prompt_composer._ensure_embeddings()
+
     # Load weights
     print(f"Loading weights from {args.weight}...")
     state_dict = torch.load(args.weight, map_location='cpu')

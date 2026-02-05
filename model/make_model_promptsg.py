@@ -506,11 +506,18 @@ class PromptSGModel(nn.Module):
 
     def load_param(self, trained_path):
         """Load pretrained parameters"""
+        # Initialize prompt_composer buffers before loading weights
+        # This ensures the buffers have the correct shape to receive checkpoint data
+        self.prompt_composer._ensure_embeddings()
+
         param_dict = torch.load(trained_path, map_location='cpu')
         for key in param_dict:
             new_key = key.replace('module.', '')
             if new_key in self.state_dict():
-                self.state_dict()[new_key].copy_(param_dict[key])
+                if self.state_dict()[new_key].shape == param_dict[key].shape:
+                    self.state_dict()[new_key].copy_(param_dict[key])
+                else:
+                    print(f"Skipping {new_key}: shape mismatch {self.state_dict()[new_key].shape} vs {param_dict[key].shape}")
 
     def forward_with_attention(self, x):
         """
