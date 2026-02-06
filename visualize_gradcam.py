@@ -369,7 +369,24 @@ def main():
     if list(state_dict.keys())[0].startswith('module.'):
         state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
 
-    model.load_state_dict(state_dict, strict=False)
+    # Filter out keys with shape mismatch to avoid RuntimeError
+    model_state = model.state_dict()
+    filtered_state_dict = {}
+    skipped_keys = []
+    for k, v in state_dict.items():
+        if k in model_state:
+            if v.shape == model_state[k].shape:
+                filtered_state_dict[k] = v
+            else:
+                skipped_keys.append(f"{k}: ckpt {v.shape} vs model {model_state[k].shape}")
+        else:
+            skipped_keys.append(f"{k}: not in model")
+    if skipped_keys:
+        print(f"Skipped {len(skipped_keys)} keys due to mismatch:")
+        for s in skipped_keys:
+            print(f"  - {s}")
+
+    model.load_state_dict(filtered_state_dict, strict=False)
     model.to(device)
     model.eval()
 
