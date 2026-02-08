@@ -23,9 +23,10 @@ def make_loss(cfg, num_classes):
         xent = CrossEntropyLabelSmooth(num_classes=num_classes)
         print("label smooth on, numclasses:", num_classes)
     
-    # Initialize SupConLoss like stage1
+    # Initialize SupConLoss with temperature from config
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    supcon_loss = SupConLoss(device)
+    supcon_temp = cfg.MODEL.PROMPTSG.TEMPERATURE
+    supcon_loss = SupConLoss(device, temperature=supcon_temp)
 
     if sampler == 'softmax':
         def loss_func(score, feat, target):

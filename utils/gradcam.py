@@ -627,7 +627,8 @@ def batch_visualize_gradcam(
 
             image = images[i:i+1].to(device)
 
-            pid_str = f"_pid{pids[i].item()}" if pids is not None else ""
+            pid_val = pids[i].item() if hasattr(pids[i], 'item') else pids[i]
+            pid_str = f"_pid{pid_val}" if pids is not None else ""
             save_path = os.path.join(output_dir, f'gradcam_{count}{pid_str}.png')
 
             try:

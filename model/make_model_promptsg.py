@@ -57,7 +57,7 @@ class InversionNetwork(nn.Module):
         self.fc1 = nn.Linear(dim, dim)
         self.fc2 = nn.Linear(dim, dim)
         self.fc3 = nn.Linear(dim, dim)
-        self.bn = nn.BatchNorm1d(dim, affine=False)
+        self.bn = nn.BatchNorm1d(dim)
         self.act = nn.ReLU(inplace=True)
 
     def forward(self, v):
@@ -445,49 +445,39 @@ class PromptSGModel(nn.Module):
         else:
             s_star = self.inversion(v)  # Generate pseudo token (512)
             prompts, tokenized = self.prompt_composer(s_star)
-            with torch.no_grad():
-                text_feat = self.text_encoder(prompts, tokenized)  # (batch, 512)
+            # Text encoder params are frozen (requires_grad=False) but gradients
+            # must flow THROUGH it to train the inversion network via L_SupCon (Eq. 4-6)
+            text_feat = self.text_encoder(prompts, tokenized)  # (batch, 512)
 
         # ========== Multimodal Interaction Module (MIM) ==========
-        # sequence, attn_map = self.mim(text_feat, patches, cls_token)
         sequence, attn_map, cls_states = self.mim(text_feat, patches, cls_token, return_cls_states=True)
-        
-        # Extract final representation from first token (text-enhanced or CLS)
-        # v_final = sequence[:, 0, :]   # (batch, 512)
-        triplet_feats = [cls_states[-1], cls_states[-2], cls_states[-3]]
-        v_final = cls_states[-1]
-        
+
+        v_final = cls_states[-1]  # Final CLS token from MIM (512-dim)
+
         # ========== Bottleneck Layers ==========
-        # Dùng img_feature (768/2048) cho bottleneck chính
-        # Dùng v_final (512) cho bottleneck projection
+        feat = self.bottleneck(CLS_final)  # CLS_final from CLIP visual encoder (768/2048)
 
-        # feat = self.bottleneck(img_feature)  # (batch, in_planes)
-        feat = self.bottleneck(CLS_final) #CLS_final: CLS x12 - 768
-
-        # Với ResNet50, cần project v_final từ 512 lên 1024 cho bottleneck_proj
         if self.model_name == 'RN50':
             if not hasattr(self, 'final_projection'):
                 self.final_projection = nn.Linear(512, 1024).to(x.device)
             feat_proj_input = self.final_projection(v_final)
         else:
-            feat_proj_input = v_final  # ViT: giữ nguyên 512
-            
+            feat_proj_input = v_final  # ViT: 512-dim
+
         feat_proj = self.bottleneck_proj(feat_proj_input)
 
         # ========== Output ==========
         if self.training:
             cls_score = self.classifier(feat)
             cls_score_proj = self.classifier_proj(feat_proj)
-            
-            # Return format: cls_score, triplet_feats, image_feat, text_feat
-            # cls_score: [cls_score, cls_score_proj] 
-            # triplet_feats: [img_feature_last, img_feature, v_final]
-            # image_feat: v_final (final representation)
-            # text_feat: text features from cross-attention
 
-            #processor đang nhận: cls_score, triplet_feats, image_feat, text_feat, target.  
-            # return [cls_score, cls_score_proj], [CLS_intermediate, CLS_final, v_final], v_final, text_feat
-            return [cls_score_proj], triplet_feats, v, text_feat
+            # Paper Eq. 10: L = L_Triplet + L_ID + λ*L_SupCon
+            # Paper Section 4.3: "the final hidden states of the vision transformer,
+            # in conjunction with the preceding two layer states, are also employed
+            # to calculate L_Triplet" (similar to CLIP-ReID multi-scale features)
+            triplet_feats = [CLS_intermediate, CLS_final, v_final]
+
+            return [cls_score, cls_score_proj], triplet_feats, v, text_feat
 
         else:
             if self.neck_feat == 'after':
