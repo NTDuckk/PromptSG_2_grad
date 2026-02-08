@@ -1,10 +1,11 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
+import math
 from .clip.simple_tokenizer import SimpleTokenizer as _Tokenizer
 _tokenizer = _Tokenizer()
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
-import torch.nn.functional as F
 
 
 def weights_init_kaiming(m):
@@ -138,41 +139,163 @@ class QuickGELU(nn.Module):
     def forward(self, x):
         return x * torch.sigmoid(1.702 * x)
 
-class PostCABlock(nn.Module):
-    """ViT-style Encoder block: PreLN -> SelfAttn -> MLP"""
-    def __init__(self, d_model=512, nhead=8, mlp_ratio=4.0, drop_path=0.0, attn_drop=0.0, proj_drop=0.0):
+class CrossAttention(nn.Module):
+    """Cross-attention with separate Q/K/V projections inspired by SeCap"""
+    def __init__(
+        self,
+        embedding_dim: int,
+        num_heads: int,
+        downsample_rate: int = 1,
+        dropout: float = 0.0
+    ):
         super().__init__()
-        self.ln1 = nn.LayerNorm(d_model)
-        self.attn = nn.MultiheadAttention(
-            embed_dim=d_model,
-            num_heads=nhead,
-            dropout=attn_drop,
-            batch_first=True
-        )
+        self.embedding_dim = embedding_dim
+        self.internal_dim = embedding_dim // downsample_rate
+        self.num_heads = num_heads
+        assert self.internal_dim % num_heads == 0, "num_heads must divide embedding_dim."
+        
+        # Separate Q/K/V projections for flexibility
+        self.q_proj = nn.Linear(embedding_dim, self.internal_dim)
+        self.k_proj = nn.Linear(embedding_dim, self.internal_dim)
+        self.v_proj = nn.Linear(embedding_dim, self.internal_dim)
+        self.out_proj = nn.Linear(self.internal_dim, embedding_dim)
+        self.dropout = nn.Dropout(dropout)
+        
+    def _separate_heads(self, x, num_heads: int):
+        b, n, c = x.shape
+        x = x.reshape(b, n, num_heads, c // num_heads)
+        return x.transpose(1, 2)  # B x N_heads x N_tokens x C_per_head
 
-        self.ln2 = nn.LayerNorm(d_model)
-        hidden = int(d_model * mlp_ratio)
-        self.mlp = nn.Sequential(
-            nn.Linear(d_model, hidden),
-            QuickGELU(),
-            nn.Dropout(proj_drop),
-            nn.Linear(hidden, d_model),
-            nn.Dropout(proj_drop),
+    def _recombine_heads(self, x):
+        b, n_heads, n_tokens, c_per_head = x.shape
+        x = x.transpose(1, 2)
+        return x.reshape(b, n_tokens, n_heads * c_per_head)  # B x N_tokens x C
+
+    def forward(self, q, k, v, need_weights=False):
+        # Input projections
+        q = self.q_proj(q)
+        k = self.k_proj(k)
+        v = self.v_proj(v)
+
+        # Separate into heads
+        q = self._separate_heads(q, self.num_heads)  # B x N_heads x N_q x C_per_head
+        k = self._separate_heads(k, self.num_heads)  # B x N_heads x N_k x C_per_head
+        v = self._separate_heads(v, self.num_heads)  # B x N_heads x N_v x C_per_head
+
+        # Attention computation
+        _, _, _, c_per_head = q.shape
+        attn = q @ k.permute(0, 1, 3, 2)  # B x N_heads x N_q x N_k
+        attn = attn / (c_per_head ** 0.5)  # Scale
+        attn = torch.softmax(attn, dim=-1)
+        attn = self.dropout(attn)
+        
+        # Apply attention
+        out = attn @ v  # B x N_heads x N_q x C_per_head
+        out = self._recombine_heads(out)  # B x N_q x C
+        out = self.out_proj(out)
+        
+        if need_weights:
+            return out, attn
+        return out
+
+class SelfAttention(nn.Module):
+    """Self-attention implementation inspired by SeCap"""
+    def __init__(self, dim, num_heads=8, qkv_bias=False, dropout=0.0):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = head_dim ** -0.5
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop = nn.Dropout(dropout)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(dropout)
+
+    def forward(self, x):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # make torchscript happy (cannot use tensor as tuple)
+
+        attn = (q @ k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+class Mlp(nn.Module):
+    """MLP with flexible activation functions"""
+    def __init__(self, in_features, hidden_features=None, out_features=None, 
+                 act_layer=nn.GELU, drop=0.):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = act_layer()
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.drop = nn.Dropout(drop)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop(x)
+        x = self.fc2(x)
+        x = self.drop(x)
+        return x
+
+class PostCABlock(nn.Module):
+    """Enhanced ViT-style Encoder block with custom attention and flexible FFN"""
+    def __init__(self, d_model=512, nhead=8, mlp_ratio=4.0, drop_path=0.0, 
+                 attn_drop=0.0, proj_drop=0.0, act_layer=QuickGELU, use_custom_attn=True):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(d_model)
+        
+        # Choose between custom self-attention or PyTorch built-in
+        if use_custom_attn:
+            self.attn = SelfAttention(
+                dim=d_model,
+                num_heads=nhead,
+                dropout=attn_drop
+            )
+        else:
+            self.attn = nn.MultiheadAttention(
+                embed_dim=d_model,
+                num_heads=nhead,
+                dropout=attn_drop,
+                batch_first=True
+            )
+        self.use_custom_attn = use_custom_attn
+        
+        self.norm2 = nn.LayerNorm(d_model)
+        hidden_features = int(d_model * mlp_ratio)
+        
+        # Use flexible MLP implementation
+        self.mlp = Mlp(
+            in_features=d_model,
+            hidden_features=hidden_features,
+            act_layer=act_layer,
+            drop=proj_drop
         )
 
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
     def forward(self, x):
-        # Self-attn
-        x_norm = self.ln1(x)
-        attn_out, _ = self.attn(x_norm, x_norm, x_norm, need_weights=False)
+        # Self-attention with residual connection
+        x_norm = self.norm1(x)
+        if self.use_custom_attn:
+            attn_out = self.attn(x_norm)
+        else:
+            attn_out, _ = self.attn(x_norm, x_norm, x_norm, need_weights=False)
         x = x + self.drop_path(attn_out)
 
-        # FFN
-        x = x + self.drop_path(self.mlp(self.ln2(x)))
+        # FFN with residual connection  
+        x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x
 
 class MultimodalInteractionModule(nn.Module):
+    """Enhanced Multimodal Interaction Module with custom cross-attention"""
     def __init__(
         self,
         embed_dim: int,
@@ -183,20 +306,33 @@ class MultimodalInteractionModule(nn.Module):
         proj_drop: float = 0.0,
         drop_path: float = 0.0,
         reweight: str = "mul_mean1",
+        use_custom_cross_attn: bool = True,
+        act_layer=QuickGELU,
     ):
         super().__init__()
         self.reweight = reweight
+        self.use_custom_cross_attn = use_custom_cross_attn
 
-        self.cross_attn = nn.MultiheadAttention(
-            embed_dim=embed_dim,
-            num_heads=num_heads,
-            dropout=attn_drop,
-            batch_first=True,
-        )
+        # Choose between custom cross-attention or PyTorch built-in
+        if use_custom_cross_attn:
+            self.cross_attn = CrossAttention(
+                embedding_dim=embed_dim,
+                num_heads=num_heads,
+                dropout=attn_drop
+            )
+        else:
+            self.cross_attn = nn.MultiheadAttention(
+                embed_dim=embed_dim,
+                num_heads=num_heads,
+                dropout=attn_drop,
+                batch_first=True,
+            )
 
+        # Layer normalization for Q and K/V
         self.q_ln = nn.LayerNorm(embed_dim)
         self.kv_ln = nn.LayerNorm(embed_dim)
 
+        # Enhanced post-cross-attention blocks
         self.post_blocks = nn.ModuleList(
             [
                 PostCABlock(
@@ -206,6 +342,8 @@ class MultimodalInteractionModule(nn.Module):
                     drop_path=drop_path,
                     attn_drop=attn_drop,
                     proj_drop=proj_drop,
+                    act_layer=act_layer,
+                    use_custom_attn=True  # Use custom self-attention in post blocks
                 )
                 for _ in range(num_blocks)
             ]
@@ -214,15 +352,21 @@ class MultimodalInteractionModule(nn.Module):
     def forward(self, text_feat, patch_tokens, cls_token, return_cls_states=False):
         B, M, D = patch_tokens.shape
 
-        q = self.q_ln(text_feat).unsqueeze(1)   # (B,1,D)
-        kv = self.kv_ln(patch_tokens)           # (B,M,D)
+        # Apply layer normalization
+        q = self.q_ln(text_feat).unsqueeze(1)   # (B,1,D) - text as query
+        kv = self.kv_ln(patch_tokens)           # (B,M,D) - patches as key/value
 
-        _, attn_w = self.cross_attn(
-            query=q, key=kv, value=kv,
-            need_weights=True,
-            average_attn_weights=False
-        )
-        attn_map = attn_w.mean(dim=1)  # (B,1,M)
+        # Cross-attention: text attends to visual patches
+        if self.use_custom_cross_attn:
+            cross_attn_out, attn_w = self.cross_attn(q, kv, kv, need_weights=True)
+            attn_map = attn_w.mean(dim=1)  # Average over heads: (B,1,M)
+        else:
+            cross_attn_out, attn_w = self.cross_attn(
+                query=q, key=kv, value=kv,
+                need_weights=True,
+                average_attn_weights=False
+            )
+            attn_map = attn_w.mean(dim=1)  # (B,1,M)
 
         # reweight patches
         if self.reweight == "mul_mean1":
@@ -298,11 +442,18 @@ class PromptSGModel(nn.Module):
         self.prompt_composer = PromptComposer(clip_model, cfg.MODEL.PROMPTSG.PROMPT_MODE)
         self.inversion = InversionNetwork(dim=512)  # Luôn là 512 vì CLIP text encoder output 512
 
-        # Multimodal Interaction Module (MIM)
+        # Enhanced Multimodal Interaction Module (MIM)
         self.mim = MultimodalInteractionModule(
             embed_dim=512,  # Luôn là 512 cho CLIP
             num_heads=cfg.MODEL.PROMPTSG.CROSS_ATTN_HEADS,
-            num_blocks=cfg.MODEL.PROMPTSG.POST_CA_BLOCKS
+            num_blocks=cfg.MODEL.PROMPTSG.POST_CA_BLOCKS,
+            mlp_ratio=4.0,
+            attn_drop=0.0,
+            proj_drop=0.0,
+            drop_path=0.0,
+            reweight="mul_mean1",  # Theo paper PromptSG
+            use_custom_cross_attn=True,  # Use custom cross-attention implementation
+            act_layer=QuickGELU,  # Theo paper PromptSG dùng QuickGELU
         )
         
         for p in self.text_encoder.parameters():

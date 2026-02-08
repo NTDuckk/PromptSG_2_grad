@@ -10,6 +10,7 @@ import torch.distributed as dist
 from torch.nn import functional as F
 import subprocess
 import sys
+import csv
 
 def setup_training_logger(cfg):
     """Setup additional file logger for training metrics"""
@@ -130,6 +131,13 @@ def do_train(cfg, model, train_loader, val_loader, optimizer, scheduler, loss_fn
 
     all_start_time = time.monotonic()
 
+    # CSV file for structured metrics (used by plot_learning_curves.py)
+    csv_path = os.path.join(cfg.OUTPUT_DIR, 'metrics.csv')
+    csv_file = open(csv_path, 'w', newline='')
+    csv_writer = csv.writer(csv_file)
+    csv_writer.writerow(['epoch', 'total_loss', 'id_loss', 'tri_loss', 'supcon_loss', 'acc', 'lr', 'mAP', 'rank1', 'rank5', 'rank10'])
+    csv_file.flush()
+
     for epoch in range(1, epochs + 1):
         start_time = time.time()
         loss_meter.reset(); acc_meter.reset(); evaluator.reset()
@@ -233,6 +241,10 @@ def do_train(cfg, model, train_loader, val_loader, optimizer, scheduler, loss_fn
         # Step scheduler AFTER epoch (not before)
         scheduler.step()
 
+        # Collect epoch metrics for CSV
+        current_lr = scheduler.get_lr()[0] if hasattr(scheduler, 'get_lr') else optimizer.param_groups[0]['lr']
+        epoch_mAP, epoch_r1, epoch_r5, epoch_r10 = '', '', '', ''
+
         if epoch % checkpoint_period == 0:
             if cfg.MODEL.DIST_TRAIN:
                 if dist.get_rank() == 0:
@@ -262,6 +274,10 @@ def do_train(cfg, model, train_loader, val_loader, optimizer, scheduler, loss_fn
                         rank_msg = "Rank-{:<3}:{:.1%}".format(r, cmc[r - 1])
                         logger.info(rank_msg)
                         metrics_logger.info(rank_msg)
+                    epoch_mAP = f'{mAP:.4f}'
+                    epoch_r1 = f'{cmc[0]:.4f}'
+                    epoch_r5 = f'{cmc[4]:.4f}'
+                    epoch_r10 = f'{cmc[9]:.4f}'
                     torch.cuda.empty_cache()
             else:
                 model.eval()
@@ -283,8 +299,26 @@ def do_train(cfg, model, train_loader, val_loader, optimizer, scheduler, loss_fn
                     rank_msg = "Rank-{:<3}:{:.1%}".format(r, cmc[r - 1])
                     logger.info(rank_msg)
                     metrics_logger.info(rank_msg)
+                epoch_mAP = f'{mAP:.4f}'
+                epoch_r1 = f'{cmc[0]:.4f}'
+                epoch_r5 = f'{cmc[4]:.4f}'
+                epoch_r10 = f'{cmc[9]:.4f}'
                 torch.cuda.empty_cache()
 
+        # Write epoch row to CSV
+        csv_writer.writerow([
+            epoch,
+            f'{loss_meter.avg:.6f}',
+            f'{id_meter.avg:.6f}',
+            f'{tri_meter.avg:.6f}',
+            f'{supcon_meter.avg:.6f}',
+            f'{acc_meter.avg:.4f}',
+            f'{current_lr:.2e}',
+            epoch_mAP, epoch_r1, epoch_r5, epoch_r10
+        ])
+        csv_file.flush()
+
+    csv_file.close()
     total_time = time.monotonic() - all_start_time
     time_msg = "Total running time: {:.1f}[s]".format(total_time)
     logger.info(time_msg)
@@ -417,7 +451,8 @@ def do_inference_with_visualization(cfg, model, val_loader, num_query, output_di
                             # Save visualization
                             fig, axes = plt.subplots(1, 3, figsize=(12, 4))
                             axes[0].imshow(img_np)
-                            axes[0].set_title(f'PID: {pid[i].item()}')
+                            pid_val = pid[i].item() if hasattr(pid[i], 'item') else pid[i]
+                            axes[0].set_title(f'PID: {pid_val}')
                             axes[0].axis('off')
 
                             axes[1].imshow(attn_map_resized, cmap='jet')
@@ -429,7 +464,8 @@ def do_inference_with_visualization(cfg, model, val_loader, num_query, output_di
                             axes[2].axis('off')
 
                             plt.tight_layout()
-                            save_path = os.path.join(vis_dir, f'vis_{vis_count}_pid{pid[i].item()}.png')
+                            pid_val = pid[i].item() if hasattr(pid[i], 'item') else pid[i]
+                            save_path = os.path.join(vis_dir, f'vis_{vis_count}_pid{pid_val}.png')
                             plt.savefig(save_path, dpi=150, bbox_inches='tight')
                             plt.close()
 

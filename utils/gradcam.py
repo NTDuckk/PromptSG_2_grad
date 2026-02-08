@@ -132,7 +132,8 @@ class GradCAM:
             target = logits.sum()
         else:
             if target_category is None:
-                target_category = logits.argmax(dim=1).item()
+                argmax_result = logits.argmax(dim=1)
+                target_category = argmax_result.item() if hasattr(argmax_result, 'item') else int(argmax_result)
             target = logits[0, target_category]
 
         # Backward pass
@@ -234,7 +235,8 @@ class GradCAMPlusPlus(GradCAM):
             logits = output if not isinstance(output, tuple) else output[0]
 
         if target_category is None and logits.dim() == 2:
-            target_category = logits.argmax(dim=1).item()
+            argmax_result = logits.argmax(dim=1)
+            target_category = argmax_result.item() if hasattr(argmax_result, 'item') else int(argmax_result)
 
         if logits.dim() == 2 and logits.size(1) <= 1000:
             target = logits[0, target_category]
